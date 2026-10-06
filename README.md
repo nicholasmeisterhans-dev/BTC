@@ -4,6 +4,8 @@
 |---|---|
 | `btc_direction_model.pine` | The indicator: bias score, UP/DOWN signals, dashboard, alerts |
 | `btc_direction_strategy.pine` | The same logic as a strategy, so you can backtest it in the Strategy Tester |
+| `btc_daytrade_model.pine` | **Day trading** indicator for 1m–15m charts (see below) |
+| `btc_daytrade_strategy.pine` | Backtest version of the day trading model |
 
 ## Install
 1. In TradingView, open a BTC chart (e.g. `BINANCE:BTCUSDT` or `COINBASE:BTCUSD`) on 1h, 4h or 1D.
@@ -37,3 +39,39 @@ on your timeframe before trusting them. Defaults include 0.1% commission and are
 
 > No indicator can tell you where BTC will go. This one tells you which way trend, momentum
 > and volume currently lean. Treat it as a filter, size positions sensibly, and not as financial advice.
+
+---
+
+# BTC Day Trading Model (`btc_daytrade_model.pine`)
+
+Built for **5m–15m charts** (works on 1m–30m). Paste it into the Pine Editor the same way:
+clear the editor first (Ctrl+A, Delete), then paste.
+
+## Factors (score -100 … +100)
+| Factor | Bullish when | Weight |
+|---|---|---|
+| Session VWAP | price above VWAP (graded by distance in ATR) | 2.0 |
+| EMA 9 / 21 | price > EMA 9 > EMA 21 | 1.5 |
+| 1h trend | 1h close above a rising 50 EMA | 1.5 |
+| Supertrend (2, 10) | uptrend | 1.0 |
+| RSI (9) | above 50 | 1.0 |
+| Volume flow | volume is concentrated in up-closing candles | 1.0 |
+
+## Signals and filters
+- **LONG** when score ≥ +50, **SHORT** when score ≤ -50, but only if:
+  - inside the session (default 08:00–21:00 UTC = London + New York),
+  - the signal candle has at least average volume (relative volume ≥ 1.0),
+  - ADX ≥ 18 (the market is trending, not chopping),
+  - at least 5 bars since the last signal.
+- After a signal, the score has to cool off to half the threshold before the same direction can fire again,
+  so it doesn't jump straight back in after a stop.
+- Every trade gets a **stop at 1.5 × ATR** and a **target at 2R** (3 × ATR), drawn on the chart.
+- Exits: **TP** (target hit), **SL** (stop hit), or grey **x** (score flipped past zero or the session ended).
+- Grey background = outside the session (no new trades). Grey step lines = previous day's high and low.
+
+## Alerts
+Create an alert → condition *BTC Day Trading Model* → `BTC-DT long`, `BTC-DT short` or `BTC-DT exit`, trigger *Once per bar close*.
+
+## Backtest
+Add `btc_daytrade_strategy.pine` on your timeframe. It assumes 0.05% commission per side and 2 ticks of slippage.
+Check net profit after fees, max drawdown and number of trades before trading it with real money.

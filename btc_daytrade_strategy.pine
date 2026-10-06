@@ -1,0 +1,180 @@
+//@version=6
+strategy("BTC Day Trading Model - Backtest", shorttitle = "BTC-DT Strat", overlay = true, initial_capital = 10000, default_qty_type = strategy.percent_of_equity, default_qty_value = 100, commission_type = strategy.commission.percent, commission_value = 0.05, slippage = 2)
+
+// =============================================================================
+// BTC Day Trading Model
+// Intraday confluence model for BTC on 1m-15m charts. Scores the short-term
+// bias from -100 (strongly bearish) to +100 (strongly bullish).
+//
+// Factors: price vs session VWAP, EMA 9/21, Supertrend, RSI, volume flow and
+// the 1h trend. Signals are filtered by trading session, relative volume, ADX
+// and a cooldown, and come with an ATR stop and a target.
+//
+// Not financial advice. This file backtests the signals of btc_daytrade_model.pine.
+// =============================================================================
+
+// ---------- Inputs ----------
+grpT = "Trend"
+emaFastLen = input.int(9, "Fast EMA", minval = 1, group = grpT)
+emaSlowLen = input.int(21, "Slow EMA", minval = 1, group = grpT)
+stFactor   = input.float(2.0, "Supertrend factor", minval = 0.1, step = 0.1, group = grpT)
+stAtrLen   = input.int(10, "Supertrend ATR length", minval = 1, group = grpT)
+htfTf      = input.timeframe("60", "Higher timeframe", group = grpT, tooltip = "Should be higher than the chart timeframe.")
+htfLen     = input.int(50, "HTF EMA length", minval = 1, group = grpT)
+
+grpM = "Momentum & Volume"
+rsiLen  = input.int(9, "RSI length", minval = 2, group = grpM)
+flowLen = input.int(14, "Volume flow length", minval = 1, group = grpM)
+rvolLen = input.int(20, "Relative volume length", minval = 1, group = grpM)
+adxLen  = input.int(14, "ADX length", minval = 2, group = grpM)
+adxMin  = input.float(18.0, "ADX min (trend strength)", minval = 0, group = grpM)
+
+grpW = "Factor weights"
+wVwap = input.float(2.0, "VWAP", minval = 0, step = 0.1, group = grpW)
+wEma  = input.float(1.5, "EMA 9/21", minval = 0, step = 0.1, group = grpW)
+wSt   = input.float(1.0, "Supertrend", minval = 0, step = 0.1, group = grpW)
+wRsi  = input.float(1.0, "RSI", minval = 0, step = 0.1, group = grpW)
+wFlow = input.float(1.0, "Volume flow", minval = 0, step = 0.1, group = grpW)
+wHtf  = input.float(1.5, "Higher timeframe", minval = 0, step = 0.1, group = grpW)
+
+grpF = "Filters"
+useSession = input.bool(true, "Only signal during session", group = grpF)
+sessStr    = input.session("0800-2100", "Session", group = grpF, tooltip = "Default 08:00-21:00 UTC covers the London and New York hours.")
+sessTz     = input.string("UTC", "Session timezone", group = grpF)
+requireAdx = input.bool(true, "Only signal when ADX shows a trend", group = grpF)
+minRvol    = input.float(1.0, "Min relative volume on signal bar", minval = 0, step = 0.1, group = grpF, tooltip = "1.0 = average volume. 0 turns the filter off.")
+cooldown   = input.int(5, "Min bars between signals", minval = 0, group = grpF)
+
+grpR = "Risk"
+atrLen   = input.int(14, "ATR length", minval = 1, group = grpR)
+stopAtr  = input.float(1.5, "Stop distance (x ATR)", minval = 0.1, step = 0.1, group = grpR)
+rrTarget = input.float(2.0, "Target (x stop distance)", minval = 0.1, step = 0.1, group = grpR)
+
+grpS = "Signals & display"
+smoothLen  = input.int(2, "Score smoothing", minval = 1, group = grpS)
+thr        = input.float(50.0, "Signal threshold", minval = 1, maxval = 100, group = grpS)
+
+// ---------- Factors (each scored -1 .. +1) ----------
+atr = ta.atr(atrLen)
+
+vwapVal = ta.vwap(hlc3, timeframe.change("D"))
+vwapScore = not na(vwapVal) and atr > 0 ? math.max(-1.0, math.min(1.0, (close - vwapVal) / (0.5 * atr))) : 0.0
+
+emaF = ta.ema(close, emaFastLen)
+emaS = ta.ema(close, emaSlowLen)
+emaScore = ((close > emaF ? 1.0 : -1.0) + (emaF > emaS ? 1.0 : -1.0)) / 2.0
+
+[stLine, stDir] = ta.supertrend(stFactor, stAtrLen)
+stScore = stDir < 0 ? 1.0 : -1.0
+
+rsi = ta.rsi(close, rsiLen)
+rsiScore = math.max(-1.0, math.min(1.0, (rsi - 50.0) / 20.0))
+
+// Volume flow: volume weighted by where each candle closed within its range.
+rng = high - low
+barDir = rng > 0 ? (close - open) / rng : 0.0
+volEma = ta.ema(volume, flowLen)
+flow = ta.ema(volume * barDir, flowLen)
+hasVol = not na(flow) and volEma > 0
+flowScore = hasVol ? math.max(-1.0, math.min(1.0, 3.0 * flow / volEma)) : 0.0
+volSma = ta.sma(volume, rvolLen)
+rvol = volSma > 0 ? volume / volSma : na
+
+// Higher timeframe trend, using the last *closed* HTF bar (no repainting).
+htfData() =>
+    e = ta.ema(close, htfLen)
+    [close[1], e[1], e[2]]
+[htfC, htfE, htfEPrev] = request.security(syminfo.tickerid, htfTf, htfData(), lookahead = barmerge.lookahead_on)
+hasHtf = not na(htfEPrev)
+htfScore = hasHtf ? ((htfC > htfE ? 1.0 : -1.0) + (htfE > htfEPrev ? 1.0 : -1.0)) / 2.0 : 0.0
+
+[diPlus, diMinus, adx] = ta.dmi(adxLen, adxLen)
+trending = adx >= adxMin
+
+// ---------- Composite score (-100 .. +100) ----------
+wFlowEff = hasVol ? wFlow : 0.0
+wHtfEff = hasHtf ? wHtf : 0.0
+wSum = wVwap + wEma + wSt + wRsi + wFlowEff + wHtfEff
+rawScore = wSum > 0 ? 100.0 * (wVwap * vwapScore + wEma * emaScore + wSt * stScore + wRsi * rsiScore + wFlowEff * flowScore + wHtfEff * htfScore) / wSum : 0.0
+score = ta.ema(rawScore, smoothLen)
+
+bias = score >= thr ? 1 : score <= -thr ? -1 : 0
+
+// ---------- Signals ----------
+inSess = not na(time(timeframe.period, sessStr, sessTz))
+okSess = not useSession or inSess
+okVol = minRvol <= 0 or (not na(rvol) and rvol >= minRvol)
+okAdx = not requireAdx or trending
+
+// pos: 1 = long, -1 = short, 0 = flat
+var int pos = 0
+var float stopLvl = na
+var float tgtLvl = na
+var int lastSigBar = na
+// After a signal, the score must cool off to half the threshold before the
+// same direction can fire again (prevents re-entering right after a stop).
+var bool armedLong = true
+var bool armedShort = true
+if score < thr * 0.5
+    armedLong := true
+if score > -thr * 0.5
+    armedShort := true
+
+cooldownOk = na(lastSigBar) or bar_index - lastSigBar >= cooldown
+okAll = okSess and okVol and okAdx and cooldownOk
+longSig  = score >= thr and okAll and armedLong and pos != 1
+shortSig = score <= -thr and okAll and armedShort and pos != -1
+
+sessOver = useSession and not inSess
+stopHitL = pos == 1 and low <= stopLvl
+tgtHitL  = pos == 1 and high >= tgtLvl
+stopHitS = pos == -1 and high >= stopLvl
+tgtHitS  = pos == -1 and low <= tgtLvl
+fadeL = pos == 1 and (score < 0 or sessOver)
+fadeS = pos == -1 and (score > 0 or sessOver)
+exitLong  = not shortSig and (stopHitL or tgtHitL or fadeL)
+exitShort = not longSig and (stopHitS or tgtHitS or fadeS)
+
+// When stop and target are both touched in one bar, assume the stop (conservative).
+exitStop = (exitLong and stopHitL) or (exitShort and stopHitS)
+exitTgt  = not exitStop and ((exitLong and tgtHitL) or (exitShort and tgtHitS))
+exitFade = (exitLong or exitShort) and not exitStop and not exitTgt
+
+if longSig
+    pos := 1
+    armedLong := false
+    lastSigBar := bar_index
+    stopLvl := close - stopAtr * atr
+    tgtLvl := close + rrTarget * stopAtr * atr
+else if shortSig
+    pos := -1
+    armedShort := false
+    lastSigBar := bar_index
+    stopLvl := close + stopAtr * atr
+    tgtLvl := close - rrTarget * stopAtr * atr
+else if exitLong or exitShort
+    pos := 0
+    stopLvl := na
+    tgtLvl := na
+
+// ---------- Orders ----------
+grpB = "Backtest"
+allowShorts = input.bool(true, "Allow shorts", group = grpB)
+
+if longSig
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long exit", "Long", stop = stopLvl, limit = tgtLvl)
+if shortSig
+    if allowShorts
+        strategy.entry("Short", strategy.short)
+        strategy.exit("Short exit", "Short", stop = stopLvl, limit = tgtLvl)
+    else
+        strategy.close("Long", comment = "Bearish")
+if exitLong and exitFade
+    strategy.close("Long", comment = sessOver ? "Session end" : "Faded")
+if exitShort and exitFade
+    strategy.close("Short", comment = sessOver ? "Session end" : "Faded")
+
+plot(score, "Score", display = display.data_window + display.status_line)
+plot(pos != 0 ? stopLvl : na, "Stop", color.new(#ef5350, 0), 1, plot.style_linebr)
+plot(pos != 0 ? tgtLvl : na, "Target", color.new(#26a69a, 0), 1, plot.style_linebr)
