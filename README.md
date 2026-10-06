@@ -73,5 +73,7 @@ clear the editor first (Ctrl+A, Delete), then paste.
 Create an alert → condition *BTC Day Trading Model* → `BTC-DT long`, `BTC-DT short` or `BTC-DT exit`, trigger *Once per bar close*.
 
 ## Backtest
+> ⚠️ **Backtested 2020–2026 on Binance BTCUSDT 15m: -98% with default settings, and every one of 32 variants lost money after fees.** See [`backtest/RESULTS.md`](backtest/RESULTS.md). Don't trade it with real money as is.
+
 Add `btc_daytrade_strategy.pine` on your timeframe. It assumes 0.05% commission per side and 2 ticks of slippage.
 Check net profit after fees, max drawdown and number of trades before trading it with real money.
