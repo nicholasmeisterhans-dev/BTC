@@ -1,0 +1,132 @@
+//@version=6
+strategy("BTC Direction Model - Backtest", shorttitle = "BTC-DM Strat", overlay = true, initial_capital = 10000, default_qty_type = strategy.percent_of_equity, default_qty_value = 100, commission_type = strategy.commission.percent, commission_value = 0.1, slippage = 2)
+
+// =============================================================================
+// BTC Direction Model
+// A multi-factor confluence model that scores the current directional bias of
+// BTC from -100 (strongly bearish) to +100 (strongly bullish).
+//
+// Factors: EMA stack, Supertrend, RSI, MACD, OBV (volume flow) and the trend on
+// a higher timeframe. ADX is used as a trend-strength filter for signals.
+//
+// Not financial advice. No indicator predicts price; this shows which way the
+// evidence currently leans. This file backtests the signals of btc_direction_model.pine.
+// =============================================================================
+
+// ---------- Inputs ----------
+grpT = "Trend"
+emaFastLen  = input.int(21, "Fast EMA", minval = 1, group = grpT)
+emaSlowLen  = input.int(55, "Slow EMA", minval = 1, group = grpT)
+emaTrendLen = input.int(200, "Trend EMA", minval = 1, group = grpT)
+stFactor    = input.float(3.0, "Supertrend factor", minval = 0.1, step = 0.1, group = grpT)
+stAtrLen    = input.int(10, "Supertrend ATR length", minval = 1, group = grpT)
+
+grpM = "Momentum & Volume"
+rsiLen   = input.int(14, "RSI length", minval = 2, group = grpM)
+macdFast = input.int(12, "MACD fast", minval = 1, group = grpM)
+macdSlow = input.int(26, "MACD slow", minval = 2, group = grpM)
+macdSig  = input.int(9, "MACD signal", minval = 1, group = grpM)
+obvLen   = input.int(20, "OBV EMA length", minval = 1, group = grpM)
+adxLen   = input.int(14, "ADX length", minval = 2, group = grpM)
+adxMin   = input.float(20.0, "ADX min (trend strength)", minval = 0, group = grpM)
+
+grpH = "Higher timeframe"
+htfTf  = input.timeframe("D", "Higher timeframe", group = grpH, tooltip = "Should be higher than the chart timeframe.")
+htfLen = input.int(50, "HTF EMA length", minval = 1, group = grpH)
+
+grpW = "Factor weights"
+wEma  = input.float(1.5, "EMA stack", minval = 0, step = 0.1, group = grpW)
+wSt   = input.float(1.5, "Supertrend", minval = 0, step = 0.1, group = grpW)
+wRsi  = input.float(1.0, "RSI", minval = 0, step = 0.1, group = grpW)
+wMacd = input.float(1.0, "MACD", minval = 0, step = 0.1, group = grpW)
+wObv  = input.float(0.75, "OBV", minval = 0, step = 0.1, group = grpW)
+wHtf  = input.float(2.0, "Higher timeframe", minval = 0, step = 0.1, group = grpW)
+
+grpS = "Signals & display"
+smoothLen  = input.int(3, "Score smoothing", minval = 1, group = grpS)
+thr        = input.float(40.0, "Signal threshold", minval = 1, maxval = 100, group = grpS)
+requireAdx = input.bool(true, "Only signal when ADX shows a trend", group = grpS)
+
+// ---------- Factors (each scored -1 .. +1) ----------
+emaF = ta.ema(close, emaFastLen)
+emaS = ta.ema(close, emaSlowLen)
+emaT = ta.ema(close, emaTrendLen)
+emaScore = ((close > emaF ? 1.0 : -1.0) + (emaF > emaS ? 1.0 : -1.0) + (emaS > emaT ? 1.0 : -1.0)) / 3.0
+
+[stLine, stDir] = ta.supertrend(stFactor, stAtrLen)
+stScore = stDir < 0 ? 1.0 : -1.0
+
+rsi = ta.rsi(close, rsiLen)
+rsiScore = math.max(-1.0, math.min(1.0, (rsi - 50.0) / 20.0))
+
+[macdLine, sigLine, hist] = ta.macd(close, macdFast, macdSlow, macdSig)
+macdScore = ((hist > 0 ? 1.0 : -1.0) + (hist > hist[1] ? 1.0 : -1.0) + (macdLine > 0 ? 1.0 : -1.0)) / 3.0
+
+obv = ta.obv
+obvEma = ta.ema(obv, obvLen)
+hasVol = not na(obvEma)
+obvScore = hasVol ? (obv > obvEma ? 1.0 : -1.0) : 0.0
+
+// Higher timeframe trend, using the last *closed* HTF bar (no repainting).
+htfData() =>
+    e = ta.ema(close, htfLen)
+    [close[1], e[1], e[2]]
+[htfC, htfE, htfEPrev] = request.security(syminfo.tickerid, htfTf, htfData(), lookahead = barmerge.lookahead_on)
+hasHtf = not na(htfEPrev)
+htfScore = hasHtf ? ((htfC > htfE ? 1.0 : -1.0) + (htfE > htfEPrev ? 1.0 : -1.0)) / 2.0 : 0.0
+
+[diPlus, diMinus, adx] = ta.dmi(adxLen, adxLen)
+trending = adx >= adxMin
+
+// ---------- Composite score (-100 .. +100) ----------
+wObvEff = hasVol ? wObv : 0.0
+wHtfEff = hasHtf ? wHtf : 0.0
+wSum = wEma + wSt + wRsi + wMacd + wObvEff + wHtfEff
+rawScore = wSum > 0 ? 100.0 * (wEma * emaScore + wSt * stScore + wRsi * rsiScore + wMacd * macdScore + wObvEff * obvScore + wHtfEff * htfScore) / wSum : 0.0
+score = ta.ema(rawScore, smoothLen)
+
+bias = score >= thr ? 1 : score <= -thr ? -1 : 0
+
+// ---------- Signals ----------
+// pos: 1 = long bias active, -1 = short bias active, 0 = flat
+var int pos = 0
+okAdx = not requireAdx or trending
+longSig  = score >= thr and okAdx and pos != 1
+shortSig = score <= -thr and okAdx and pos != -1
+exitLong  = pos == 1 and not shortSig and score < 0
+exitShort = pos == -1 and not longSig and score > 0
+
+if longSig
+    pos := 1
+else if shortSig
+    pos := -1
+else if exitLong or exitShort
+    pos := 0
+
+// ---------- Orders ----------
+grpB = "Backtest"
+showStLine  = input.bool(true, "Show Supertrend", group = grpB)
+allowShorts = input.bool(true, "Allow shorts", group = grpB)
+useStop     = input.bool(true, "Use ATR stop loss", group = grpB)
+stopAtr     = input.float(2.5, "Stop distance (x ATR)", minval = 0.1, step = 0.1, group = grpB)
+atr = ta.atr(14)
+
+if longSig
+    strategy.entry("Long", strategy.long)
+if shortSig
+    if allowShorts
+        strategy.entry("Short", strategy.short)
+    else
+        strategy.close("Long", comment = "Bearish")
+if exitLong
+    strategy.close("Long", comment = "Faded")
+if exitShort
+    strategy.close("Short", comment = "Faded")
+
+if useStop and strategy.position_size > 0
+    strategy.exit("Long SL", "Long", stop = strategy.position_avg_price - stopAtr * atr)
+if useStop and strategy.position_size < 0
+    strategy.exit("Short SL", "Short", stop = strategy.position_avg_price + stopAtr * atr)
+
+plot(score, "Score", display = display.data_window + display.status_line)
+plot(showStLine ? stLine : na, "Supertrend", stDir < 0 ? color.new(#26a69a, 0) : color.new(#ef5350, 0), 2, plot.style_linebr)

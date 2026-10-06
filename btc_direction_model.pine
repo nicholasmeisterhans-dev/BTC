@@ -1,0 +1,166 @@
+//@version=6
+indicator("BTC Direction Model", shorttitle = "BTC-DM", overlay = true, max_labels_count = 500)
+
+// =============================================================================
+// BTC Direction Model
+// A multi-factor confluence model that scores the current directional bias of
+// BTC from -100 (strongly bearish) to +100 (strongly bullish).
+//
+// Factors: EMA stack, Supertrend, RSI, MACD, OBV (volume flow) and the trend on
+// a higher timeframe. ADX is used as a trend-strength filter for signals.
+//
+// Not financial advice. No indicator predicts price; this shows which way the
+// evidence currently leans. Backtest it (see btc_direction_strategy.pine).
+// =============================================================================
+
+// ---------- Inputs ----------
+grpT = "Trend"
+emaFastLen  = input.int(21, "Fast EMA", minval = 1, group = grpT)
+emaSlowLen  = input.int(55, "Slow EMA", minval = 1, group = grpT)
+emaTrendLen = input.int(200, "Trend EMA", minval = 1, group = grpT)
+stFactor    = input.float(3.0, "Supertrend factor", minval = 0.1, step = 0.1, group = grpT)
+stAtrLen    = input.int(10, "Supertrend ATR length", minval = 1, group = grpT)
+
+grpM = "Momentum & Volume"
+rsiLen   = input.int(14, "RSI length", minval = 2, group = grpM)
+macdFast = input.int(12, "MACD fast", minval = 1, group = grpM)
+macdSlow = input.int(26, "MACD slow", minval = 2, group = grpM)
+macdSig  = input.int(9, "MACD signal", minval = 1, group = grpM)
+obvLen   = input.int(20, "OBV EMA length", minval = 1, group = grpM)
+adxLen   = input.int(14, "ADX length", minval = 2, group = grpM)
+adxMin   = input.float(20.0, "ADX min (trend strength)", minval = 0, group = grpM)
+
+grpH = "Higher timeframe"
+htfTf  = input.timeframe("D", "Higher timeframe", group = grpH, tooltip = "Should be higher than the chart timeframe.")
+htfLen = input.int(50, "HTF EMA length", minval = 1, group = grpH)
+
+grpW = "Factor weights"
+wEma  = input.float(1.5, "EMA stack", minval = 0, step = 0.1, group = grpW)
+wSt   = input.float(1.5, "Supertrend", minval = 0, step = 0.1, group = grpW)
+wRsi  = input.float(1.0, "RSI", minval = 0, step = 0.1, group = grpW)
+wMacd = input.float(1.0, "MACD", minval = 0, step = 0.1, group = grpW)
+wObv  = input.float(0.75, "OBV", minval = 0, step = 0.1, group = grpW)
+wHtf  = input.float(2.0, "Higher timeframe", minval = 0, step = 0.1, group = grpW)
+
+grpS = "Signals & display"
+smoothLen  = input.int(3, "Score smoothing", minval = 1, group = grpS)
+thr        = input.float(40.0, "Signal threshold", minval = 1, maxval = 100, group = grpS)
+requireAdx = input.bool(true, "Only signal when ADX shows a trend", group = grpS)
+showEmas   = input.bool(true, "Show EMAs", group = grpS)
+showSt     = input.bool(true, "Show Supertrend", group = grpS)
+showBg     = input.bool(true, "Background bias colour", group = grpS)
+colorBars  = input.bool(false, "Colour bars by score", group = grpS)
+showTable  = input.bool(true, "Show dashboard", group = grpS)
+
+// ---------- Factors (each scored -1 .. +1) ----------
+emaF = ta.ema(close, emaFastLen)
+emaS = ta.ema(close, emaSlowLen)
+emaT = ta.ema(close, emaTrendLen)
+emaScore = ((close > emaF ? 1.0 : -1.0) + (emaF > emaS ? 1.0 : -1.0) + (emaS > emaT ? 1.0 : -1.0)) / 3.0
+
+[stLine, stDir] = ta.supertrend(stFactor, stAtrLen)
+stScore = stDir < 0 ? 1.0 : -1.0
+
+rsi = ta.rsi(close, rsiLen)
+rsiScore = math.max(-1.0, math.min(1.0, (rsi - 50.0) / 20.0))
+
+[macdLine, sigLine, hist] = ta.macd(close, macdFast, macdSlow, macdSig)
+macdScore = ((hist > 0 ? 1.0 : -1.0) + (hist > hist[1] ? 1.0 : -1.0) + (macdLine > 0 ? 1.0 : -1.0)) / 3.0
+
+obv = ta.obv
+obvEma = ta.ema(obv, obvLen)
+hasVol = not na(obvEma)
+obvScore = hasVol ? (obv > obvEma ? 1.0 : -1.0) : 0.0
+
+// Higher timeframe trend, using the last *closed* HTF bar (no repainting).
+htfData() =>
+    e = ta.ema(close, htfLen)
+    [close[1], e[1], e[2]]
+[htfC, htfE, htfEPrev] = request.security(syminfo.tickerid, htfTf, htfData(), lookahead = barmerge.lookahead_on)
+hasHtf = not na(htfEPrev)
+htfScore = hasHtf ? ((htfC > htfE ? 1.0 : -1.0) + (htfE > htfEPrev ? 1.0 : -1.0)) / 2.0 : 0.0
+
+[diPlus, diMinus, adx] = ta.dmi(adxLen, adxLen)
+trending = adx >= adxMin
+
+// ---------- Composite score (-100 .. +100) ----------
+wObvEff = hasVol ? wObv : 0.0
+wHtfEff = hasHtf ? wHtf : 0.0
+wSum = wEma + wSt + wRsi + wMacd + wObvEff + wHtfEff
+rawScore = wSum > 0 ? 100.0 * (wEma * emaScore + wSt * stScore + wRsi * rsiScore + wMacd * macdScore + wObvEff * obvScore + wHtfEff * htfScore) / wSum : 0.0
+score = ta.ema(rawScore, smoothLen)
+
+bias = score >= thr ? 1 : score <= -thr ? -1 : 0
+
+// ---------- Signals ----------
+// pos: 1 = long bias active, -1 = short bias active, 0 = flat
+var int pos = 0
+okAdx = not requireAdx or trending
+longSig  = score >= thr and okAdx and pos != 1
+shortSig = score <= -thr and okAdx and pos != -1
+exitLong  = pos == 1 and not shortSig and score < 0
+exitShort = pos == -1 and not longSig and score > 0
+
+if longSig
+    pos := 1
+else if shortSig
+    pos := -1
+else if exitLong or exitShort
+    pos := 0
+
+// ---------- Visuals ----------
+bullCol = color.new(#26a69a, 0)
+bearCol = color.new(#ef5350, 0)
+neutCol = color.new(#9e9e9e, 0)
+scoreCol = score >= thr ? bullCol : score <= -thr ? bearCol : score > 0 ? color.new(#26a69a, 50) : color.new(#ef5350, 50)
+
+plot(showEmas ? emaF : na, "Fast EMA", color.new(#2196f3, 0), 1)
+plot(showEmas ? emaS : na, "Slow EMA", color.new(#ff9800, 0), 1)
+plot(showEmas ? emaT : na, "Trend EMA", color.new(#9c27b0, 0), 2)
+plot(showSt ? stLine : na, "Supertrend", stDir < 0 ? bullCol : bearCol, 2, plot.style_linebr)
+plot(score, "Score", scoreCol, display = display.data_window + display.status_line)
+
+bgcolor(showBg and bias == 1 ? color.new(#26a69a, 90) : showBg and bias == -1 ? color.new(#ef5350, 90) : na, title = "Bias background")
+barcolor(colorBars ? scoreCol : na, title = "Score bar colour")
+
+plotshape(longSig, "Bullish signal", shape.labelup, location.belowbar, bullCol, text = "UP", textcolor = color.white, size = size.small)
+plotshape(shortSig, "Bearish signal", shape.labeldown, location.abovebar, bearCol, text = "DOWN", textcolor = color.white, size = size.small)
+plotshape(exitLong, "Exit long", shape.xcross, location.abovebar, neutCol, size = size.tiny)
+plotshape(exitShort, "Exit short", shape.xcross, location.belowbar, neutCol, size = size.tiny)
+
+// ---------- Dashboard ----------
+factorText(float v) =>
+    v > 0.33 ? "▲ Bullish" : v < -0.33 ? "▼ Bearish" : "• Neutral"
+factorColor(float v) =>
+    v > 0.33 ? bullCol : v < -0.33 ? bearCol : neutCol
+
+var table dash = table.new(position.top_right, 2, 10, bgcolor = color.new(#131722, 10), border_color = color.new(#363a45, 0), border_width = 1, frame_color = color.new(#363a45, 0), frame_width = 1)
+
+if showTable and barstate.islast
+    biasTxt = bias == 1 ? "BULLISH ▲" : bias == -1 ? "BEARISH ▼" : "NEUTRAL"
+    biasCol = bias == 1 ? bullCol : bias == -1 ? bearCol : neutCol
+    table.cell(dash, 0, 0, "BTC Direction Model", text_color = color.white, text_size = size.small)
+    table.merge_cells(dash, 0, 0, 1, 0)
+    table.cell(dash, 0, 1, "Bias", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 1, biasTxt, text_color = color.white, bgcolor = biasCol, text_size = size.small)
+    table.cell(dash, 0, 2, "Score", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 2, str.tostring(score, "0.0"), text_color = scoreCol, text_size = size.small)
+    table.cell(dash, 0, 3, "Trend strength (ADX)", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 3, str.tostring(adx, "0.0") + (trending ? " trending" : " ranging"), text_color = trending ? color.white : neutCol, text_size = size.small)
+    table.cell(dash, 0, 4, "EMA stack", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 4, factorText(emaScore), text_color = factorColor(emaScore), text_size = size.small)
+    table.cell(dash, 0, 5, "Supertrend", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 5, factorText(stScore), text_color = factorColor(stScore), text_size = size.small)
+    table.cell(dash, 0, 6, "RSI " + str.tostring(rsi, "0"), text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 6, factorText(rsiScore), text_color = factorColor(rsiScore), text_size = size.small)
+    table.cell(dash, 0, 7, "MACD", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 7, factorText(macdScore), text_color = factorColor(macdScore), text_size = size.small)
+    table.cell(dash, 0, 8, "Volume flow (OBV)", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 8, hasVol ? factorText(obvScore) : "n/a", text_color = factorColor(obvScore), text_size = size.small)
+    table.cell(dash, 0, 9, "HTF trend (" + htfTf + ")", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 9, hasHtf ? factorText(htfScore) : "n/a", text_color = factorColor(htfScore), text_size = size.small)
+
+// ---------- Alerts ----------
+alertcondition(longSig, "BTC-DM bullish signal", "BTC Direction Model: bullish signal on {{ticker}} ({{interval}}) at {{close}}")
+alertcondition(shortSig, "BTC-DM bearish signal", "BTC Direction Model: bearish signal on {{ticker}} ({{interval}}) at {{close}}")
+alertcondition(exitLong or exitShort, "BTC-DM bias faded", "BTC Direction Model: bias faded back toward neutral on {{ticker}} ({{interval}}) at {{close}}")
